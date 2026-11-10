@@ -1,0 +1,702 @@
+
+name: Carry
+
+on:
+  workflow_dispatch:
+    inputs:
+      pull_request_number:
+        description: Request number to copy
+        required: true
+        type: number
+
+concurrency: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.inputs.pull_request_number }}
+
+permissions:
+  contents: read
+
+jobs:
+  resolve-pr:
+    name: Read request
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    if: |
+      github.repository_owner == 'timhaines' &&
+      (
+        github.event_name == 'workflow_dispatch' ||
+        (
+          github.event.action == 'labeled' &&
+          github.event.label.name == 'carry'
+        ) ||
+        (
+          github.event.action == 'closed' &&
+          github.event.pull_request.merged == true &&
+          contains(github.event.pull_request.labels.*.name, 'carry')
+        )
+      )
+    outputs:
+      should-carry: ${{ steps.resolve.outputs.should-carry }}
+      pr-number: ${{ steps.resolve.outputs.pr-number }}
+      pr-title: ${{ steps.resolve.outputs.pr-title }}
+      pr-author-login: ${{ steps.resolve.outputs.pr-author-login }}
+      pr-author-type: ${{ steps.resolve.outputs.pr-author-type }}
+      merged-by-login: ${{ steps.resolve.outputs.merged-by-login }}
+      merged-by-type: ${{ steps.resolve.outputs.merged-by-type }}
+      merge-commit-sha: ${{ steps.resolve.outputs.merge-commit-sha }}
+      base-ref: ${{ steps.resolve.outputs.base-ref }}
+
+    steps:
+      - name: Wrap CLI
+        run: |
+          set -euo pipefail
+
+          REAL_GH="$(command -v gh)"
+          WRAPPER_DIR="$RUNNER_TEMP/cli-wrap"
+          mkdir -p "$WRAPPER_DIR"
+
+          cat > "$WRAPPER_DIR/gh" <<EOF
+          #!/usr/bin/env bash
+          REAL_GH="${REAL_GH}"
+
+          printf '+ gh' >&2
+          printf ' %q' "\$@" >&2
+          printf '\n' >&2
+
+          stdout_file="\$(mktemp)"
+          stderr_file="\$(mktemp)"
+          trap 'rm -f "\$stdout_file" "\$stderr_file"' EXIT
+
+          "\$REAL_GH" "\$@" >"\$stdout_file" 2>"\$stderr_file"
+          status=\$?
+
+          if [ "\$status" -eq 0 ]; then
+            cat "\$stdout_file"
+            cat "\$stderr_file" >&2
+          else
+            echo "::warning::CLI exited with \$status" >&2
+            if [ -s "\$stderr_file" ]; then
+              echo "::group::gh stderr" >&2
+              cat "\$stderr_file" >&2
+              echo "::endgroup::" >&2
+            fi
+            if [ -s "\$stdout_file" ]; then
+              echo "::group::gh stdout" >&2
+              cat "\$stdout_file" >&2
+              echo "::endgroup::" >&2
+            fi
+            echo "::group::run context" >&2
+            echo "workflow=\${GITHUB_WORKFLOW:-}" >&2
+            echo "job=\${GITHUB_JOB:-}" >&2
+            echo "event=\${GITHUB_EVENT_NAME:-}" >&2
+            echo "repository=\${GITHUB_REPOSITORY:-}" >&2
+            echo "run_id=\${GITHUB_RUN_ID:-}" >&2
+            echo "ref=\${GITHUB_REF:-}" >&2
+            echo "sha=\${GITHUB_SHA:-}" >&2
+            echo "event_path=\${GITHUB_EVENT_PATH:-}" >&2
+            echo "REPO=\${REPO:-}" >&2
+            echo "PR_NUMBER=\${PR_NUMBER:-}" >&2
+            echo "PR_EVENT_NUMBER=\${PR_EVENT_NUMBER:-}" >&2
+            echo "PR_ACTION=\${PR_ACTION:-}" >&2
+            echo "::endgroup::" >&2
+            exit "\$status"
+          fi
+          EOF
+
+          sed -i 's/^          //' "$WRAPPER_DIR/gh"
+          chmod +x "$WRAPPER_DIR/gh"
+          echo "$WRAPPER_DIR" >> "$GITHUB_PATH"
+
+      - name: Look up request
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_ACTION: ${{ github.event.action }}
+          PR_EVENT_NUMBER: ${{ github.event.pull_request.number }}
+          DISPATCH_PR_NUMBER: ${{ github.event.inputs.pull_request_number }}
+          ISSUE_LABEL: ${{ github.event.label.name }}
+          LABELER_LOGIN: ${{ github.event.sender.login }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          set_output() {
+            local name="$1"
+            local value="$2"
+            {
+              echo "${name}<<EOF"
+              echo "${value}"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          }
+
+          skip() {
+            echo "$1"
+            set_output "should-carry" "false"
+            exit 0
+          }
+
+          PR_NUMBER=""
+
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            if [ "$PR_ACTION" = "labeled" ] && [ "$ISSUE_LABEL" != "carry" ]; then
+              skip "Other tag: $ISSUE_LABEL"
+            fi
+            [ -n "$PR_EVENT_NUMBER" ] || {
+              echo "::error::no number on the event"
+              exit 1
+            }
+            PR_NUMBER="$PR_EVENT_NUMBER"
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            [ -n "$DISPATCH_PR_NUMBER" ] || {
+              echo "::error::no number in the inputs"
+              exit 1
+            }
+            PR_NUMBER="$DISPATCH_PR_NUMBER"
+          else
+            skip "Event not handled: $EVENT_NAME"
+          fi
+
+          PR=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}")
+          MERGED=$(echo "$PR" | jq -r '.merged')
+          [ "$MERGED" = "true" ] || skip "PR #${PR_NUMBER} has no merge"
+
+          HAS_CARRY_LABEL=$(gh api "repos/${REPO}/issues/${PR_NUMBER}/labels" \
+            --jq 'any(.[]; .name == "carry")')
+          [ "$HAS_CARRY_LABEL" = "true" ] || skip "PR #${PR_NUMBER} lacks the tag"
+
+          HEAD_REPO=$(echo "$PR" | jq -r '.head.repo.full_name // empty')
+          if [ "$EVENT_NAME" = "pull_request" ] && [ "$HEAD_REPO" != "$REPO" ]; then
+            {
+              echo "@${LABELER_LOGIN} fork request; start the run by hand."
+              echo
+              echo 'Start it here:'
+              echo 'https://github.com/timhaines/sandbox-ea244e49-279acf/actions/workflows/carry.yml'
+              echo
+              echo 'Or run:'
+              echo
+              echo '```sh'
+              echo "gh workflow run carry.yml --repo timhaines/sandbox-ea244e49-279acf -f pull_request_number=${PR_NUMBER}"
+              echo '```'
+            } > comment.md
+
+            gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file comment.md \
+              || echo "::warning::no comment on #${PR_NUMBER} (read-only token)"
+            skip "PR #${PR_NUMBER} is a fork request; dispatch it"
+          fi
+
+          BASE_REF=$(echo "$PR" | jq -r '.base.ref')
+          case "$BASE_REF" in
+            main|release-v*) ;;
+            *) skip "PR #${PR_NUMBER} has an unhandled base: ${BASE_REF}" ;;
+          esac
+
+          set_output "should-carry" "true"
+          set_output "pr-number" "$PR_NUMBER"
+          set_output "pr-title" "$(echo "$PR" | jq -r '.title')"
+          set_output "pr-author-login" "$(echo "$PR" | jq -r '.user.login')"
+          set_output "pr-author-type" "$(echo "$PR" | jq -r '.user.type')"
+          set_output "merged-by-login" "$(echo "$PR" | jq -r '.merged_by.login // empty')"
+          set_output "merged-by-type" "$(echo "$PR" | jq -r '.merged_by.type // empty')"
+          set_output "merge-commit-sha" "$(echo "$PR" | jq -r '.merge_commit_sha')"
+          set_output "base-ref" "$BASE_REF"
+
+  find-branch:
+    name: Choose target
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: resolve-pr
+    if: |
+      github.repository_owner == 'timhaines' &&
+      needs.resolve-pr.outputs.should-carry == 'true'
+    outputs:
+      release-branch: ${{ steps.find-target.outputs.release-branch }}
+
+    steps:
+      - name: Fetch sources
+        id: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        continue-on-error: true
+        with:
+          fetch-depth: 0
+
+      - name: Pause before fetch 1
+        if: steps.checkout.outcome == 'failure'
+        run: sleep 60
+
+      - name: Fetch sources (retry 1)
+        id: checkout-retry-1
+        if: steps.checkout.outcome == 'failure'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        continue-on-error: true
+        with:
+          fetch-depth: 0
+
+      - name: Pause before fetch 2
+        if: steps.checkout.outcome == 'failure' && steps.checkout-retry-1.outcome == 'failure'
+        run: sleep 180
+
+      - name: Fetch sources (retry 2)
+        if: steps.checkout.outcome == 'failure' && steps.checkout-retry-1.outcome == 'failure'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Choose target
+        id: find-target
+        run: |
+          ATTEMPTS=5
+          for attempt in $(seq 1 "$ATTEMPTS"); do
+            if git fetch --all; then
+              break
+            fi
+            if [ "$attempt" -eq "$ATTEMPTS" ]; then
+              echo "::error::fetch gave up after $ATTEMPTS attempts"
+              exit 1
+            fi
+            WAIT=$((attempt * 30))
+            echo "Try $attempt failed, waiting ${WAIT}s..."
+            sleep "$WAIT"
+          done
+
+          BASE_REF="${{ needs.resolve-pr.outputs.base-ref }}"
+          RELEASE_BRANCHES=$(git branch -r | grep -E 'origin/release-v[0-9]+\.[0-9]+$' | sed 's/.*origin\///' | sort -V)
+
+          if [ -z "$RELEASE_BRANCHES" ]; then
+            echo "::error::no release-vX.Y branches"
+            exit 1
+          fi
+
+          echo "Branches: $RELEASE_BRANCHES"
+
+          if [ "$BASE_REF" = "main" ]; then
+            TARGET=$(echo "$RELEASE_BRANCHES" | tail -n 1)
+          else
+            TARGET=$(echo "$RELEASE_BRANCHES" | grep -B1 "^${BASE_REF}$" | head -n 1)
+            if [ "$TARGET" = "$BASE_REF" ] || [ -z "$TARGET" ]; then
+              echo "::error::nothing older than $BASE_REF"
+              exit 1
+            fi
+          fi
+
+          echo "Target: $TARGET"
+          echo "release-branch=$TARGET" >> "$GITHUB_OUTPUT"
+
+  carry:
+    name: Carry to ${{ needs.find-branch.outputs.release-branch }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [resolve-pr, find-branch]
+    if: |
+      github.repository_owner == 'timhaines' &&
+      needs.resolve-pr.outputs.should-carry == 'true'
+    concurrency:
+      group: carry-${{ needs.resolve-pr.outputs.pr-number }}-${{ needs.find-branch.outputs.release-branch }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+
+    steps:
+      - name: Set committer
+        run: |
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
+
+      - name: Wrap CLI
+        run: |
+          set -euo pipefail
+
+          REAL_GH="$(command -v gh)"
+          WRAPPER_DIR="$RUNNER_TEMP/cli-wrap"
+          mkdir -p "$WRAPPER_DIR"
+
+          cat > "$WRAPPER_DIR/gh" <<EOF
+          #!/usr/bin/env bash
+          REAL_GH="${REAL_GH}"
+
+          printf '+ gh' >&2
+          printf ' %q' "\$@" >&2
+          printf '\n' >&2
+
+          stdout_file="\$(mktemp)"
+          stderr_file="\$(mktemp)"
+          trap 'rm -f "\$stdout_file" "\$stderr_file"' EXIT
+
+          "\$REAL_GH" "\$@" >"\$stdout_file" 2>"\$stderr_file"
+          status=\$?
+
+          if [ "\$status" -eq 0 ]; then
+            cat "\$stdout_file"
+            cat "\$stderr_file" >&2
+          else
+            echo "::warning::CLI exited with \$status" >&2
+            if [ -s "\$stderr_file" ]; then
+              echo "::group::gh stderr" >&2
+              cat "\$stderr_file" >&2
+              echo "::endgroup::" >&2
+            fi
+            if [ -s "\$stdout_file" ]; then
+              echo "::group::gh stdout" >&2
+              cat "\$stdout_file" >&2
+              echo "::endgroup::" >&2
+            fi
+            echo "::group::run context" >&2
+            echo "workflow=\${GITHUB_WORKFLOW:-}" >&2
+            echo "job=\${GITHUB_JOB:-}" >&2
+            echo "event=\${GITHUB_EVENT_NAME:-}" >&2
+            echo "repository=\${GITHUB_REPOSITORY:-}" >&2
+            echo "run_id=\${GITHUB_RUN_ID:-}" >&2
+            echo "ref=\${GITHUB_REF:-}" >&2
+            echo "sha=\${GITHUB_SHA:-}" >&2
+            echo "event_path=\${GITHUB_EVENT_PATH:-}" >&2
+            echo "REPO=\${REPO:-}" >&2
+            echo "PR_NUMBER=\${PR_NUMBER:-}" >&2
+            echo "CARRY_BRANCH=\${CARRY_BRANCH:-}" >&2
+            echo "BASE_BRANCH=\${BASE_BRANCH:-}" >&2
+            echo "::endgroup::" >&2
+            exit "\$status"
+          fi
+          EOF
+
+          sed -i 's/^          //' "$WRAPPER_DIR/gh"
+          chmod +x "$WRAPPER_DIR/gh"
+          echo "$WRAPPER_DIR" >> "$GITHUB_PATH"
+
+      - name: Look for earlier run
+        id: check-existing
+        run: |
+          CARRY_BRANCH="carry-pr-${{ needs.resolve-pr.outputs.pr-number }}-to-${{ needs.find-branch.outputs.release-branch }}"
+          EXISTING_PR=$(gh api "repos/${{ github.repository }}/pulls?head=${{ github.repository_owner }}:${CARRY_BRANCH}&state=open" --jq '.[0].html_url // empty')
+          if [ -n "$EXISTING_PR" ]; then
+            echo "Already open: $EXISTING_PR — skipping."
+            echo "existing-pr=$EXISTING_PR" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Clear tag (done before)
+        if: steps.check-existing.outputs.existing-pr
+        run: |
+          gh pr edit ${{ needs.resolve-pr.outputs.pr-number }} --remove-label carry || true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Stop on CI file edits
+        if: '!steps.check-existing.outputs.existing-pr'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ needs.resolve-pr.outputs.pr-number }}
+          RELEASE_BRANCH: ${{ needs.find-branch.outputs.release-branch }}
+        run: |
+          set -euo pipefail
+
+          WORKFLOW_FILES=$(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/files" \
+            --jq '[.[] | select(.filename | startswith(".github/workflows/")) | .filename] | join(", ")')
+
+          if [ -z "$WORKFLOW_FILES" ]; then
+            exit 0
+          fi
+
+          echo "::error::PR #${PR_NUMBER} edits CI files (${WORKFLOW_FILES}); the job token can't write those. Do it by hand."
+
+          gh pr comment "$PR_NUMBER" --body "❌ Carry to \`${RELEASE_BRANCH}\` skipped: CI files changed (\`${WORKFLOW_FILES}\`) and the job token can't write them. Please do it by hand." \
+            || echo "::warning::comment failed on #${PR_NUMBER} (non-fatal)"
+
+          gh pr edit "$PR_NUMBER" --remove-label carry \
+            || echo "::warning::tag removal failed on #${PR_NUMBER} (non-fatal)"
+
+          exit 1
+
+      - name: Fetch sources
+        if: '!steps.check-existing.outputs.existing-pr'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.find-branch.outputs.release-branch }}
+
+      - name: Start branch
+        if: '!steps.check-existing.outputs.existing-pr'
+        run: |
+          git checkout -b carry-pr-${{ needs.resolve-pr.outputs.pr-number }}-to-${{ needs.find-branch.outputs.release-branch }} origin/${{ needs.find-branch.outputs.release-branch }}
+
+      - name: Apply change
+        if: '!steps.check-existing.outputs.existing-pr'
+        id: cherry-pick
+        run: |
+          MERGE_COMMIT="${{ needs.resolve-pr.outputs.merge-commit-sha }}"
+
+          CHERRY_PICK_OUTPUT=$(git cherry-pick -m 1 "$MERGE_COMMIT" 2>&1) || CHERRY_PICK_EXIT_CODE=$?
+          echo "$CHERRY_PICK_OUTPUT"
+          echo "git-output<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$CHERRY_PICK_OUTPUT" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+          if [ "${CHERRY_PICK_EXIT_CODE:-0}" -ne 0 ]; then
+            echo "Apply failed; needs a person."
+            echo "::error::could not apply $MERGE_COMMIT to ${{ needs.find-branch.outputs.release-branch }} branch"
+            echo "has-conflicts=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has-conflicts=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Move sample dirs for release-v5.0
+        if: "!steps.check-existing.outputs.existing-pr && needs.find-branch.outputs.release-branch == 'release-v5.0' && steps.cherry-pick.outputs.has-conflicts == 'false'"
+        run: |
+          if [ -d "examples/old-layout" ]; then
+            echo "Found examples/old-layout dir, moving to examples/new-layout..."
+            
+            for file in $(find examples/old-layout -type f); do
+              target="${file/examples\/old-layout/examples/new-layout}"
+              mkdir -p "$(dirname "$target")"
+              git mv "$file" "$target"
+            done
+            
+            rm -rf examples/old-layout
+            
+            git add .
+            git commit --amend --no-edit
+            
+            echo "Moved sample dirs from examples/old-layout/ to examples/new-layout/"
+          else
+            echo "No examples/old-layout found, nothing to move"
+          fi
+
+      - name: Commit conflicts
+        if: "!steps.check-existing.outputs.existing-pr && steps.cherry-pick.outputs.has-conflicts == 'true'"
+        run: |
+          git add .
+          git commit -m "Conflicts for #${{ needs.resolve-pr.outputs.pr-number }} to ${{ needs.find-branch.outputs.release-branch }}"
+      - name: Publish branch
+        if: '!steps.check-existing.outputs.existing-pr'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          BASE_BRANCH: ${{ needs.find-branch.outputs.release-branch }}
+          CARRY_BRANCH: carry-pr-${{ needs.resolve-pr.outputs.pr-number }}-to-${{ needs.find-branch.outputs.release-branch }}
+        run: |
+          set -euo pipefail
+
+          PARENT_OID=$(git rev-parse "origin/${BASE_BRANCH}")
+          HEADLINE=$(git log -1 --format=%s HEAD)
+
+          WORK="$(mktemp -d)"
+          ADDITIONS="${WORK}/additions.json"
+          DELETIONS="${WORK}/deletions.json"
+          BODY_FILE="${WORK}/body.txt"
+          PAYLOAD="${WORK}/payload.json"
+          DIFF="${WORK}/diff"
+
+          git log -1 --format=%b HEAD > "$BODY_FILE"
+          echo '[]' > "$ADDITIONS"
+          echo '[]' > "$DELETIONS"
+
+          git diff --no-ext-diff --no-renames --ignore-submodules=none --raw --no-abbrev -z "${PARENT_OID}" HEAD > "$DIFF"
+          while IFS= read -r -d '' entry && IFS= read -r -d '' path; do
+            read -r old_mode new_mode old_oid new_oid status <<< "${entry#:}"
+            case "$status" in
+              D)
+                jq -c --arg p "$path" '. + [{path: $p}]' "$DELETIONS" > "${DELETIONS}.tmp"
+                mv "${DELETIONS}.tmp" "$DELETIONS"
+                ;;
+              A|M|T)
+                case "$old_mode:$new_mode" in
+                  000000:100644|100644:100644) ;;
+                  *)
+                    echo "::error::unhandled mode ${old_mode} -> ${new_mode}; do it by hand."
+                    printf 'Path: %q\n' "$path"
+                    exit 1
+                    ;;
+                esac
+                b64="${WORK}/b64"
+                git cat-file blob "$new_oid" | base64 | tr -d '\n' > "$b64"
+                jq -c --arg p "$path" --rawfile c "$b64" \
+                  '. + [{path: $p, contents: $c}]' \
+                  "$ADDITIONS" > "${ADDITIONS}.tmp"
+                mv "${ADDITIONS}.tmp" "$ADDITIONS"
+                ;;
+              *)
+                echo "::error::unhandled status: ${status}"
+                exit 1
+                ;;
+            esac
+          done < "$DIFF"
+
+          if gh api "repos/${REPO}/git/refs/heads/${CARRY_BRANCH}" >/dev/null 2>&1; then
+            echo "Branch ${CARRY_BRANCH} is left from an earlier run; resetting to ${PARENT_OID}."
+            gh api --method PATCH "repos/${REPO}/git/refs/heads/${CARRY_BRANCH}" \
+              -f "sha=${PARENT_OID}" -F force=true >/dev/null
+          else
+            gh api --method POST "repos/${REPO}/git/refs" \
+              -f "ref=refs/heads/${CARRY_BRANCH}" \
+              -f "sha=${PARENT_OID}" >/dev/null
+          fi
+
+          jq -n \
+            --arg query 'mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { oid url } } }' \
+            --arg repo "${REPO}" \
+            --arg branch "${CARRY_BRANCH}" \
+            --arg expected "${PARENT_OID}" \
+            --arg headline "${HEADLINE}" \
+            --rawfile body "$BODY_FILE" \
+            --slurpfile additions "$ADDITIONS" \
+            --slurpfile deletions "$DELETIONS" \
+            '{
+              query: $query,
+              variables: {
+                input: {
+                  branch: {repositoryNameWithOwner: $repo, branchName: $branch},
+                  expectedHeadOid: $expected,
+                  message: {headline: $headline, body: ($body | rtrimstr("\n"))},
+                  fileChanges: {additions: $additions[0], deletions: $deletions[0]}
+                }
+              }
+            }' > "$PAYLOAD"
+
+          gh api graphql --input "$PAYLOAD"
+
+      - name: Choose owner
+        if: '!steps.check-existing.outputs.existing-pr'
+        id: assignee
+        run: |
+          if [ "$MERGED_BY_TYPE" = "User" ]; then
+            echo "login=$MERGED_BY_LOGIN" >> "$GITHUB_OUTPUT"
+          elif [ "$PR_AUTHOR_TYPE" = "User" ]; then
+            echo "login=$PR_AUTHOR_LOGIN" >> "$GITHUB_OUTPUT"
+          else
+            REVIEWER=$(gh api "repos/${{ github.repository }}/pulls/${{ needs.resolve-pr.outputs.pr-number }}/reviews" \
+              --jq '[.[] | select(.user.type == "User")] | last | .user.login // empty')
+            if [ -n "$REVIEWER" ]; then
+              echo "login=$REVIEWER" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MERGED_BY_TYPE: ${{ needs.resolve-pr.outputs.merged-by-type }}
+          MERGED_BY_LOGIN: ${{ needs.resolve-pr.outputs.merged-by-login }}
+          PR_AUTHOR_TYPE: ${{ needs.resolve-pr.outputs.pr-author-type }}
+          PR_AUTHOR_LOGIN: ${{ needs.resolve-pr.outputs.pr-author-login }}
+
+      - name: Open request
+        if: '!steps.check-existing.outputs.existing-pr'
+        id: create-pr
+        run: |
+          set -euo pipefail
+
+          ASSIGNEE_FLAG=""
+          if [ -n "$ASSIGNEE_LOGIN" ]; then
+            ASSIGNEE_FLAG="--assignee $ASSIGNEE_LOGIN"
+          fi
+
+          OWNER="${REPO%%/*}"
+          NAME="${REPO#*/}"
+          CLOSING_ISSUES=$(gh api graphql \
+            -f query='
+              query($owner: String!, $name: String!, $number: Int!) {
+                repository(owner: $owner, name: $name) {
+                  pullRequest(number: $number) {
+                    closingIssuesReferences(first: 100) {
+                      nodes {
+                        number
+                        repository {
+                          nameWithOwner
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            ' \
+            -f owner="$OWNER" \
+            -f name="$NAME" \
+            -F number="$ORIGINAL_PR_NUMBER" \
+            --jq '.data.repository.pullRequest.closingIssuesReferences.nodes[] | [.repository.nameWithOwner, .number] | @tsv')
+
+          ISSUE_REFERENCES=""
+          if [ -n "$CLOSING_ISSUES" ]; then
+            while IFS=$'\t' read -r issue_repo issue_number; do
+              if [ "$issue_repo" = "$REPO" ]; then
+                issue_reference="#${issue_number}"
+              else
+                issue_reference="${issue_repo}#${issue_number}"
+              fi
+              ISSUE_REFERENCES+="${ISSUE_REFERENCES:+$'\n'}Fixes ${issue_reference}"
+            done <<< "$CLOSING_ISSUES"
+          fi
+
+          if [ "${{ steps.cherry-pick.outputs.has-conflicts }}" = "true" ]; then
+            PR_BODY="$PR_BODY_CONFLICTS"
+            if [ -n "$ISSUE_REFERENCES" ]; then
+              PR_BODY+=$'\n\n'"$ISSUE_REFERENCES"
+            fi
+            PR_URL=$(gh pr create \
+              --title "$PR_TITLE" \
+              --body "$PR_BODY" \
+              --base ${{ needs.find-branch.outputs.release-branch }} \
+              --head carry-pr-${{ needs.resolve-pr.outputs.pr-number }}-to-${{ needs.find-branch.outputs.release-branch }} \
+              $ASSIGNEE_FLAG \
+              --draft)
+          else
+            PR_BODY="$PR_BODY_NO_CONFLICTS"
+            if [ -n "$ISSUE_REFERENCES" ]; then
+              PR_BODY+=$'\n\n'"$ISSUE_REFERENCES"
+            fi
+            PR_URL=$(gh pr create \
+              --title "$PR_TITLE" \
+              --body "$PR_BODY" \
+              --base ${{ needs.find-branch.outputs.release-branch }} \
+              --head carry-pr-${{ needs.resolve-pr.outputs.pr-number }}-to-${{ needs.find-branch.outputs.release-branch }} \
+              $ASSIGNEE_FLAG)
+          fi
+          echo "carry-pr-url=$PR_URL" >> "$GITHUB_OUTPUT"
+          gh pr merge "$PR_URL" --auto --squash || echo "no auto-merge"
+          echo "Opened $PR_URL"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          ORIGINAL_PR_NUMBER: ${{ needs.resolve-pr.outputs.pr-number }}
+          ASSIGNEE_LOGIN: ${{ steps.assignee.outputs.login }}
+          PR_TITLE: 'Carry: ${{ needs.resolve-pr.outputs.pr-title }}'
+          PR_BODY_NO_CONFLICTS: 'Automated copy of #${{ needs.resolve-pr.outputs.pr-number }} to the ${{ needs.find-branch.outputs.release-branch }}; cc @${{ needs.resolve-pr.outputs.pr-author-login }}'
+          PR_BODY_CONFLICTS: |
+
+            Automated copy of #${{ needs.resolve-pr.outputs.pr-number }} to the ${{ needs.find-branch.outputs.release-branch }}; cc @${{ needs.resolve-pr.outputs.pr-author-login }}
+            Conflicts to fix by hand.
+
+
+            ```
+            ${{ steps.cherry-pick.outputs.git-output }}
+            ```
+
+      - name: Clear tag on source
+        if: '!steps.check-existing.outputs.existing-pr && steps.create-pr.outputs.carry-pr-url'
+        run: |
+          gh pr edit ${{ needs.resolve-pr.outputs.pr-number }} --remove-label carry \
+            || echo "::warning::tag removal failed on #${{ needs.resolve-pr.outputs.pr-number }} (non-fatal)"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Note success
+        if: "!steps.check-existing.outputs.existing-pr && steps.cherry-pick.outputs.has-conflicts == 'false' && steps.create-pr.outputs.carry-pr-url"
+        run: |
+          gh pr comment ${{ needs.resolve-pr.outputs.pr-number }} --body "✅ Done: ${{ steps.create-pr.outputs.carry-pr-url }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Note conflicts
+        if: "!steps.check-existing.outputs.existing-pr && steps.cherry-pick.outputs.has-conflicts == 'true' && steps.create-pr.outputs.carry-pr-url"
+        run: |
+          gh pr comment ${{ needs.resolve-pr.outputs.pr-number }} --body "⚠️ Carry to ${{ needs.find-branch.outputs.release-branch }} conflicted: ${{ steps.create-pr.outputs.carry-pr-url }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Note failure
+        if: "!steps.check-existing.outputs.existing-pr && steps.cherry-pick.outputs.has-conflicts == 'true' && !steps.create-pr.outputs.carry-pr-url"
+        run: |
+          gh pr comment ${{ needs.resolve-pr.outputs.pr-number }} --body "❌ Carry to ${{ needs.find-branch.outputs.release-branch }} failed; needs a person. [run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
